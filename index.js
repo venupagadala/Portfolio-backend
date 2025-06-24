@@ -4,8 +4,19 @@ const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+
+// ✅ Recommended CORS configuration
+const corsOptions = {
+  origin: '*', // Use your frontend domain in production (e.g., 'https://your-site.com')
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
+
+// ✅ Handle CORS preflight request for /send
+app.options('/send', cors(corsOptions));
 
 app.post('/send', async (req, res) => {
   const { name, email, message, phone } = req.body;
@@ -17,8 +28,8 @@ app.post('/send', async (req, res) => {
   const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-      user: process.env.EMAIL_USER, // your Gmail (e.g., venupagadala13@gmail.com)
-      pass: process.env.EMAIL_PASS, // 16-char app password (no spaces)
+      user: process.env.EMAIL_USER, // your Gmail
+      pass: process.env.EMAIL_PASS, // your app password (16 characters)
     },
   });
 
