@@ -16,6 +16,6 @@
     "express": "^5.1.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": "22.x"
   }
 }
