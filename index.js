@@ -1,68 +1,118 @@
+// Portfolio contact API.
+//
+// Sends contact-form messages through Resend's HTTPS API. Render's free plan
+// blocks outbound SMTP (ports 25/465/587) since Sept 2025, which made the old
+// Gmail/Nodemailer version hang until it timed out. HTTPS on 443 is allowed.
+
 const express = require('express');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
 require('dotenv').config();
+
+const {
+  RESEND_API_KEY,
+  CONTACT_TO_EMAIL, // where messages are delivered (your inbox)
+  CONTACT_FROM_EMAIL = 'Portfolio Contact <onboarding@resend.dev>',
+  ALLOWED_ORIGINS = '', // comma-separated, e.g. https://venupagadala.github.io
+  RESEND_API_URL = 'https://api.resend.com/emails', // overridable for tests
+  PORT = 5000,
+} = process.env;
+
+const SEND_TIMEOUT_MS = 10_000;
+const LIMITS = { name: 100, email: 200, phone: 30, message: 5000 };
 
 const app = express();
 
-// ✅ Recommended CORS configuration
+const origins = ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
 const corsOptions = {
-  origin: '*', // Use your frontend domain in production (e.g., 'https://your-site.com')
+  origin: origins.length ? origins : '*',
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type'],
 };
-
 app.use(cors(corsOptions));
-app.use(express.json());
-
-// ✅ Handle CORS preflight request for /send
 app.options('/send', cors(corsOptions));
+app.use(express.json({ limit: '20kb' }));
+
+// Visitor input goes into an HTML email, so escape it.
+const escapeHtml = (value) =>
+  String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+const isEmail = (value) => /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/.test(value);
+
+function validate(body) {
+  const fields = {
+    name: String(body?.name ?? '').trim(),
+    email: String(body?.email ?? '').trim(),
+    phone: String(body?.phone ?? '').trim(),
+    message: String(body?.message ?? '').trim(),
+  };
+  if (!fields.name || !fields.email || !fields.message) return { error: 'Missing required fields.' };
+  if (!isEmail(fields.email)) return { error: 'Invalid email address.' };
+  for (const [key, max] of Object.entries(LIMITS)) {
+    if (fields[key].length > max) return { error: `${key} is too long.` };
+  }
+  return { fields };
+}
+
+// Lets the frontend (or an uptime pinger) wake the free instance early.
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/send', async (req, res) => {
-  const { name, email, message, phone } = req.body;
+  const { fields, error } = validate(req.body);
+  if (error) return res.status(400).json({ success: false, message: error });
 
-  if (!name || !email || !message) {
-    return res.status(400).json({ success: false, message: 'Missing required fields.' });
+  if (!RESEND_API_KEY || !CONTACT_TO_EMAIL) {
+    console.error('❌ Email is not configured: set RESEND_API_KEY and CONTACT_TO_EMAIL.');
+    return res.status(500).json({ success: false, message: 'Email service is not configured.' });
   }
 
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.EMAIL_USER, // your Gmail
-      pass: process.env.EMAIL_PASS, // your app password (16 characters)
-    },
-  });
-
-  const htmlContent = `
+  const { name, email, phone, message } = fields;
+  const html = `
     <div style="font-family: system-ui, Arial, sans-serif; font-size: 14px;">
       <p><strong>You received a new message from your portfolio contact form:</strong></p>
       <div style="margin: 16px 0; padding: 12px; border: 1px dashed #ccc; border-radius: 6px;">
-        <p><strong>Name:</strong> ${name}</p>
-        <p><strong>Email:</strong> <a href="mailto:${email}">${email}</a></p>
-        ${phone ? `<p><strong>Phone:</strong> ${phone}</p>` : ''}
-        <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+        <p><strong>Name:</strong> ${escapeHtml(name)}</p>
+        <p><strong>Email:</strong> <a href="mailto:${escapeHtml(email)}">${escapeHtml(email)}</a></p>
+        ${phone ? `<p><strong>Phone:</strong> ${escapeHtml(phone)}</p>` : ''}
+        <p><strong>Time:</strong> ${new Date().toUTCString()}</p>
         <hr style="margin: 12px 0;">
-        <p style="white-space: pre-line; font-size: 15px;">${message}</p>
+        <p style="white-space: pre-line; font-size: 15px;">${escapeHtml(message)}</p>
       </div>
-    </div>
-  `;
+    </div>`;
 
   try {
-    const info = await transporter.sendMail({
-      from: `"${name}" <${process.env.EMAIL_USER}>`,
-      to: process.env.EMAIL_USER,
-      subject: `New Message from ${name}`,
-      html: htmlContent,
-      replyTo: email,
+    const response = await fetch(RESEND_API_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: CONTACT_FROM_EMAIL,
+        to: [CONTACT_TO_EMAIL],
+        reply_to: email,
+        subject: `New message from ${name.slice(0, 80)}`,
+        html,
+        text: `From: ${name} <${email}>${phone ? `\nPhone: ${phone}` : ''}\n\n${message}`,
+      }),
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     });
 
-    console.log('✅ Email sent:', info.messageId);
-    res.status(200).json({ success: true, message: 'Email sent successfully!' });
+    if (!response.ok) {
+      console.error('❌ Resend rejected the email:', response.status, await response.text());
+      return res.status(502).json({ success: false, message: 'Failed to send email.' });
+    }
+
+    const { id } = await response.json();
+    console.log('✅ Email sent:', id);
+    return res.status(200).json({ success: true, message: 'Email sent successfully!' });
   } catch (err) {
-    console.error('❌ Email send failed:', err);
-    res.status(500).json({ success: false, message: 'Failed to send email.' });
+    console.error('❌ Email send failed:', err.name === 'TimeoutError' ? 'timed out' : err);
+    return res.status(502).json({ success: false, message: 'Failed to send email.' });
   }
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+}
+
+module.exports = app;
